@@ -1,115 +1,145 @@
 #!/bin/bash
-# ============================================================
-#  哪吒面板入侵 自查脚本 (nezha_ioc_check.sh)
-# ------------------------------------------------------------
-#  用途:排查 2026-06 哪吒面板漏洞批量入侵的常见植入物
-#  特点:只读检测,不删除/不修改任何东西,可放心运行
-#  用法:直接在被检查的服务器上执行  bash nezha_ioc_check.sh
-#        或从本地批量: ssh 节点 'bash -s' < nezha_ioc_check.sh
-# ------------------------------------------------------------
-#  发现 [警] 即需人工核查;全部显示"未发现"则该项干净。
-#  注意:本脚本只负责"发现",清理请人工判断后手动进行。
-# ============================================================
 
-ALERT=0
-echo "=========================================="
-echo " 哪吒入侵自查: $(hostname)  $(date '+%F %T')"
-echo "=========================================="
+echo "=================================================="
+echo "    Nezha 深度排查与清理脚本  "
+echo "=================================================="
+# ----------------------------------------------------
+# [0] 排查与清理 恶意 Nezha Agent
+# ----------------------------------------------------
 
-# ---- 1) memfd 内存马 ----
-# 攻击者用 memfd_create 把恶意程序只放在内存、磁盘无文件,
-# 常伪装成 [kworker/x:x]。靠 /proc/PID/exe 指向 memfd 识别。
-echo "[1] memfd 内存马"
-for pid in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
-  if ls -l /proc/$pid/exe 2>/dev/null | grep -qi "memfd"; then
-    echo "  [警] PID $pid 指向 memfd  cmd=$(cat /proc/$pid/cmdline 2>/dev/null | tr '\0' ' ')"
-    ALERT=1
-  fi
+echo "=== 开始清理恶意 Nezha Agent ==="
+
+# 1. 查找并停止所有带有随机后缀的 nezha-agent 服务
+# 使用正则匹配 nezha-agent-xxx.service 格式，排除正常的 nezha-agent.service
+for svc in $(systemctl list-units --type=service --all | grep -Eo 'nezha-agent-[a-zA-Z0-9\-]+\.service'); do
+    echo "发现异常服务并正在清除: $svc"
+    systemctl stop "$svc"
+    systemctl disable "$svc"
+    rm -f "/etc/systemd/system/$svc"
+    rm -f "/usr/lib/systemd/system/$svc"
 done
 
-# ---- 2) kworker 伪装(进程名像内核线程,却有用户态 exe)----
-# 真内核线程父进程是 kthreadd(PID 2)且无 exe;伪装的则有真实 exe。
-# 注:请把下面 EXCLUDE 里换成你自己合法的、恰好以 k 开头的程序名(如 komari)。
-EXCLUDE_COMM="kdump|komari|kubelet"
-echo "[2] kworker 伪装进程"
-for pid in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
-  comm=$(cat /proc/$pid/comm 2>/dev/null)
-  exe=$(readlink /proc/$pid/exe 2>/dev/null)
-  ppid=$(awk '{print $4}' /proc/$pid/stat 2>/dev/null)
-  case "$comm" in
-    k*)
-      if [ -n "$exe" ] && [ "$ppid" != "2" ]; then
-        if ! echo "$comm" | grep -qE "^($EXCLUDE_COMM)" && [ "${exe#*/usr/lib/systemd/}" = "$exe" ]; then
-          echo "  [警] PID $pid 进程名=$comm 父=$ppid exe=$exe"
-          ALERT=1
-        fi
-      fi
-      ;;
-  esac
-done
+# 2. 重新加载系统服务守护进程
+systemctl daemon-reload
 
-# ---- 3) 执行已删除文件的进程((deleted))----
-# 程序跑起来后删掉自身文件,只留内存副本。排除正常软件路径与升级残留。
-# 注:把 /app 换成你自己正常程序所在目录,避免误报。
-echo "[3] 已删除文件执行"
-for pid in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
-  exe=$(readlink /proc/$pid/exe 2>/dev/null)
-  case "$exe" in
-    *"(deleted)"*)
-      case "$exe" in
-        */usr/*|*/bin/*|*/sbin/*|*/app/*|*/snap/*) ;;
-        *) echo "  [警] PID $pid exe=$exe"; ALERT=1 ;;
-      esac
-      ;;
-  esac
-done
+# 3. 清理 /opt/nezha/agent/ 目录下带有随机后缀的配置文件
+# 匹配 config-*.yml，这样不会误删你正常的 config.yml
+find /opt/nezha/agent/ -name "config-*.yml" -type f -exec rm -f {} +
+echo "已清理异常配置文件"
 
-# ---- 4) 恶意哪吒 Agent(随机后缀 config / service,连第三方主控)----
-echo "[4] 恶意哪吒 Agent 残留"
-ps aux | grep -i 'nezha-agent' | grep -v grep | grep -E 'config-[a-z0-9]+\.yml' \
-  && { echo "  [警] 发现随机后缀 config 的 agent 进程"; ALERT=1; }
-ls /etc/systemd/system/ 2>/dev/null | grep -E 'nezha-agent-[a-z0-9]+\.service' \
-  && { echo "  [警] 发现随机后缀 nezha service"; ALERT=1; }
-ls /opt/nezha/agent/config-*.yml 2>/dev/null \
-  && { echo "  [警] 发现随机 config 文件"; ALERT=1; }
+# 4. 强杀可能残留的恶意进程 (针对指定了恶意配置文件的进程)
+ps aux | grep 'nezha-agent' | grep 'config-' | awk '{print $2}' | xargs -r kill -9
+echo "已清理残留内存进程"
 
-# ---- 5) 挖矿程序(XMRig / c3pool)----
-echo "[5] 挖矿程序"
-[ -e /root/c3pool ] && { echo "  [警] /root/c3pool 目录存在"; ALERT=1; }
-pgrep -x xmrig >/dev/null 2>&1 && { echo "  [警] xmrig 进程在运行"; ALERT=1; }
-[ -e /etc/systemd/system/c3pool_miner.service ] && { echo "  [警] c3pool_miner.service 存在"; ALERT=1; }
+echo "=== 清理完成 ==="
+# ----------------------------------------------------
+# [1] 排查与清理 SSH 后门公钥
+# ----------------------------------------------------
+echo "[1/4] 正在排查 SSH 后门公钥..."
+AUTH_FILE="/root/.ssh/authorized_keys"
 
-# ---- 6) 守护/复活服务(SystemLoger / systemlog.service)----
-echo "[6] 守护复活服务"
-pgrep -x SystemLoger >/dev/null 2>&1 && { echo "  [警] SystemLoger 进程在运行"; ALERT=1; }
-[ -e /opt/systemlog ] && { echo "  [警] /opt/systemlog 目录存在"; ALERT=1; }
-[ -e /etc/systemd/system/systemlog.service ] && { echo "  [警] systemlog.service 存在"; ALERT=1; }
-
-# ---- 7) SSH 后门公钥 ----
-# 网传后门公钥常带 gary 之类注释;这里同时提示你核对公钥总数。
-echo "[7] SSH 后门公钥"
-grep -i "gary" ~/.ssh/authorized_keys 2>/dev/null \
-  && { echo "  [警] authorized_keys 含可疑公钥(gary)"; ALERT=1; }
-echo "  (当前 authorized_keys 公钥数: $(grep -c '^ssh-' ~/.ssh/authorized_keys 2>/dev/null))"
-
-# ---- 8) 自启动持久化(cron / 可疑 service)----
-echo "[8] 持久化(cron)"
-for u in $(cut -f1 -d: /etc/passwd); do
-  c=$(crontab -l -u "$u" 2>/dev/null | grep -vE '^\s*#|^\s*$')
-  [ -n "$c" ] && { echo "  [信息] 用户 $u 有 cron(请核对):"; echo "$c" | sed 's/^/      /'; }
-done
-grep -rEl 'curl|wget|/tmp/|base64 -d' /etc/cron* /var/spool/cron 2>/dev/null \
-  && { echo "  [警] 上述 cron 文件含可疑下载/执行"; ALERT=1; }
-
-# ---- 9) ld.so.preload 劫持 ----
-echo "[9] ld.so.preload"
-[ -f /etc/ld.so.preload ] && { echo "  [警] /etc/ld.so.preload 存在(默认不该有):"; cat /etc/ld.so.preload | sed 's/^/      /'; ALERT=1; }
-
-# ---- 结论 ----
-echo "=========================================="
-if [ "$ALERT" -eq 0 ]; then
-  echo " 结论: 未发现已知植入物 ✅ (但不代表绝对安全,被 root 控制过仍建议重装)"
+if [ -f "$AUTH_FILE" ]; then
+    # 解除可能存在的文件锁定
+    chattr -i "$AUTH_FILE" 2>/dev/null
+    
+    # 1. 自动删除已知的 gary@gary 恶意公钥
+    if grep -q "gary@gary" "$AUTH_FILE"; then
+        sed -i '/gary@gary/d' "$AUTH_FILE"
+        echo "  [+] 已自动删除匹配的恶意公钥 (gary@gary)！"
+    fi
+    
+    # 2. 统计剩余的有效公钥数量 (排除空行和注释行)
+    KEY_COUNT=$(grep -v '^\s*$' "$AUTH_FILE" | grep -v '^\s*#' | wc -l)
+    
+    if [ "$KEY_COUNT" -gt 0 ]; then
+        echo -e "\033[31m  [!] 警告：发现 $KEY_COUNT 个 SSH 公钥驻留！\033[0m"
+        echo "  请务必人工核对以下公钥是否为你本人所有："
+        echo "--------------------------------------------------"
+        cat "$AUTH_FILE"
+        echo "--------------------------------------------------"
+        echo "  如发现未知公钥，请立刻运行: nano $AUTH_FILE 进行删除！"
+    else
+        echo "  [-] 当前无任何 SSH 公钥存留，安全。"
+    fi
 else
-  echo " 结论: 发现 [警] 项,请逐条人工核查 ⚠️"
+    echo "  [-] 未找到 $AUTH_FILE 文件，跳过。"
 fi
-echo "=========================================="
+
+
+# ----------------------------------------------------
+# [2] 排查伪装的 kworker 内存马与 memfd 进程
+# ----------------------------------------------------
+echo -e "\n[2/4] 正在排查伪装的 kworker 内存马与 memfd 进程..."
+
+# 查杀特征 1：/proc/*/exe 指向 memfd 的异常进程
+MEM_PIDS=$(ls -l /proc/[0-9]*/exe 2>/dev/null | grep "memfd" | awk -F'/proc/' '{print $2}' | awk -F'/' '{print $1}')
+for PID in $MEM_PIDS; do
+    echo "  [+] 发现异常 memfd 进程 (PID: $PID)，正在强制结束..."
+    kill -9 "$PID" 2>/dev/null
+done
+
+# 查杀特征 2：没有中括号的 kworker 进程 (使用 [k] 避免 grep 抓到自己)
+FAKE_KWORKERS=$(ps -eo pid,comm,args | grep '[k]worker' | grep -v '\[' | awk '{print $1}')
+if [ -n "$FAKE_KWORKERS" ]; then
+    for PID in $FAKE_KWORKERS; do
+        echo "  [+] 发现伪装的 kworker 进程 (PID: $PID)，正在强制结束..."
+        kill -9 "$PID" 2>/dev/null
+    done
+else
+    echo "  [-] 未发现活跃的假 kworker 进程或 memfd 内存马。"
+fi
+
+
+# ----------------------------------------------------
+# [3] 排查恶意守护服务 (SystemLoger等)
+# ----------------------------------------------------
+echo -e "\n[3/4] 正在排查恶意系统服务..."
+SYSTEMLOGER_SVC=$(systemctl list-unit-files --type=service 2>/dev/null | grep -i "SystemLoger" | awk '{print $1}')
+
+if [ -n "$SYSTEMLOGER_SVC" ]; then
+    echo "  [+] 发现恶意服务 $SYSTEMLOGER_SVC ！正在清理..."
+    
+    systemctl stop "$SYSTEMLOGER_SVC" 2>/dev/null
+    systemctl disable "$SYSTEMLOGER_SVC" 2>/dev/null
+    
+    for SVC_FILE in $(find /etc/systemd/system /usr/lib/systemd/system /lib/systemd/system -name "$SYSTEMLOGER_SVC" 2>/dev/null); do
+        # 提取并删除二进制文件本体
+        BIN_PATH=$(grep "^ExecStart=" "$SVC_FILE" | awk -F'=' '{print $2}' | awk '{print $1}')
+        if [ -n "$BIN_PATH" ] && [ -f "$BIN_PATH" ]; then
+            chattr -i "$BIN_PATH" 2>/dev/null
+            rm -f "$BIN_PATH"
+            echo "  [+] 已删除恶意程序本体: $BIN_PATH"
+        fi
+        
+        # 删除服务配置
+        chattr -i "$SVC_FILE" 2>/dev/null
+        rm -f "$SVC_FILE"
+        echo "  [+] 已删除服务配置文件: $SVC_FILE"
+    done
+    systemctl daemon-reload
+else
+    echo "  [-] 未发现 SystemLoger 恶意服务。"
+fi
+
+
+# ----------------------------------------------------
+# [4] 探测可疑定时任务 (Cron) 关联复活机制
+# ----------------------------------------------------
+echo -e "\n[4/4] 正在检测可疑的定时任务 (Cron)..."
+
+# 搜索包含已知黑客 IP 段或高危外连命令的任务
+SUSPICIOUS_CRON=$(crontab -l 2>/dev/null | grep -E "207\.58\.173\.192|24\.[0-9]+\.|curl|wget|bash")
+
+if [ -n "$SUSPICIOUS_CRON" ]; then
+    echo -e "\033[31m  [!] 警告：在当前 root 用户的 crontab 中发现可疑任务！\033[0m"
+    echo "--------------------------------------------------"
+    echo "$SUSPICIOUS_CRON"
+    echo "--------------------------------------------------"
+    echo "  请运行 'crontab -e' 仔细核对，如果不是你设置的，请立刻删除！"
+else
+    echo "  [-] root 用户的 crontab 未见包含已知恶意 IP 或下载命令的异常任务。"
+fi
+
+echo "=================================================="
+echo "               执行完毕，请注意查收警告信息       "
+echo "=================================================="
